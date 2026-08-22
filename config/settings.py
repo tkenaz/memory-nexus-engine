@@ -7,7 +7,9 @@ from pydantic_settings import BaseSettings
 from pydantic import validator, computed_field
 
 # Load environment variables
-load_dotenv()
+# Resolve .env relative to the repo root, not the cwd (Claude Desktop/Code
+# spawn MCP servers from an arbitrary working directory).
+load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 
 class Settings(BaseSettings):
