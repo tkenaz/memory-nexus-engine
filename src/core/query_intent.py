@@ -4,15 +4,24 @@ from enum import Enum
 import re
 
 
+def _starts_word(marker: str, text: str) -> bool:
+    """True if `marker` occurs at the start of a word in `text`.
+
+    Markers are stems ("устал" matches "устала"), but must not match inside a word
+    ("test" must not match "latest").
+    """
+    return re.search(r"(?<!\w)" + re.escape(marker), text) is not None
+
+
 class QueryIntent(Enum):
     """Types of query intents"""
     TEMPORAL = "temporal"       # "последние", "вчера", "на этой неделе"
     PERSON = "person"           # names of people, e.g. "Alice", "Bob"
-    PROJECT = "project"         # names of projects, e.g. "MyApp", "Atlas"
+    PROJECT = "project"         # names of projects, e.g. "MyApp", "my-project"
     TECHNICAL = "technical"     # "код", "баг", "архитектура"
     EMOTIONAL = "emotional"     # "устала", "радость", "грустно"
-    FACTUAL = "factual"        # конкретные факты, числа
-    MIXED = "mixed"            # смешанный тип
+    FACTUAL = "factual"        # specific facts, numbers
+    MIXED = "mixed"            # mixed type
 
 
 class QueryIntentDetector:
@@ -23,7 +32,7 @@ class QueryIntentDetector:
         # People whose names should trigger PERSON intent, e.g. {'alice', 'боб'}.
         self.persons: set = set()
 
-        # Projects whose names should trigger PROJECT intent, e.g. {'my-app', 'атлас'}.
+        # Projects whose names should trigger PROJECT intent, e.g. {'my-app', 'мой-проект'}.
         self.projects: set = {'memory-nexus', 'memory nexus'}
 
         self.technical_markers = {
@@ -74,31 +83,31 @@ class QueryIntentDetector:
 
         # Detect persons
         for person in self.persons:
-            if person in query_lower:
+            if _starts_word(person, query_lower):
                 context['entities']['persons'].append(person)
                 intents.append(QueryIntent.PERSON)
 
         # Detect projects
         for project in self.projects:
-            if project in query_lower:
+            if _starts_word(project, query_lower):
                 context['entities']['projects'].append(project)
                 intents.append(QueryIntent.PROJECT)
 
         # Detect technical terms
         for tech in self.technical_markers:
-            if tech in query_lower:
+            if _starts_word(tech, query_lower):
                 context['entities']['technical'].append(tech)
                 intents.append(QueryIntent.TECHNICAL)
 
         # Detect temporal markers
         for temporal in self.temporal_markers:
-            if temporal in query_lower:
+            if _starts_word(temporal, query_lower):
                 context['entities']['temporal'].append(temporal)
                 intents.append(QueryIntent.TEMPORAL)
 
         # Detect emotional markers
         for emotion in self.emotional_markers:
-            if emotion in query_lower:
+            if _starts_word(emotion, query_lower):
                 context['entities']['emotional'].append(emotion)
                 intents.append(QueryIntent.EMOTIONAL)
 
@@ -106,11 +115,13 @@ class QueryIntentDetector:
         if re.search(r'\d+', query) or re.search(r'\$|€|₽', query):
             intents.append(QueryIntent.FACTUAL)
 
-        # Determine primary intent
-        if not intents:
+        # Determine primary intent: MIXED only when markers of different kinds fire
+        # (two technical words are still a TECHNICAL query).
+        kinds = list(dict.fromkeys(intents))
+        if not kinds:
             primary_intent = QueryIntent.FACTUAL  # Default
-        elif len(intents) == 1:
-            primary_intent = intents[0]
+        elif len(kinds) == 1:
+            primary_intent = kinds[0]
         else:
             primary_intent = QueryIntent.MIXED
 
@@ -142,21 +153,14 @@ class QueryIntentDetector:
 
     def disambiguate_query(self, query: str, intent: QueryIntent, context: Dict) -> str:
         """
-        Disambiguate query based on detected intent
+        Disambiguate query based on detected intent.
 
-        For example, if "Атлас" is detected as a project,
-        add context to improve search
+        Currently a pass-through for every intent; kept as the hook where
+        intent-specific query expansion belongs.
         """
         enhanced_query = query
 
-        if intent == QueryIntent.PROJECT and context['entities']['projects']:
-            # Add project context
-            project = context['entities']['projects'][0]
-            if project in ['atlas', 'атлас']:
-                # Disambiguate Atlas project from mythology/geography
-                enhanced_query = f"{query} проект система"
-
-        elif intent == QueryIntent.TEMPORAL:
+        if intent == QueryIntent.TEMPORAL:
             # Temporal queries often need the subject
             if not any(context['entities'][k] for k in ['persons', 'projects']):
                 # No known subject in a temporal query — leave it as-is.

@@ -2,7 +2,7 @@
 import json
 from typing import Dict, List, Optional, Any, Tuple
 from uuid import UUID
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import asyncpg
 import asyncio
 import numpy as np
@@ -18,11 +18,12 @@ logging.getLogger().setLevel(logging.CRITICAL)
 os.environ['TRANSFORMERS_VERBOSITY'] = 'error'
 os.environ['TOKENIZERS_PARALLELISM'] = 'false'
 
-from FlagEmbedding import BGEM3FlagModel
+from ..core.encoder import load_bge_m3
 from pgvector.asyncpg import register_vector
 
 from ..models.sashf import SceneFrame, MemoryLink, LinkType, Pattern, Affect
 from ..core.sashf_parser import SASHFParser
+from ..search.rank_fusion import rrf_fuse
 from ..core.query_intent import QueryIntentDetector, QueryIntent
 from ..core import chunker
 from .postgres import PostgresStorage
@@ -38,6 +39,28 @@ class NullLogger:
     def debug(self, *args, **kwargs): pass
 
 logger = NullLogger()
+
+
+# Month names for date phrases in queries: Russian genitive ("21 августа") and
+# nominative ("август 2025"), English full and abbreviated.
+_MONTHS = {}
+for _n, _forms in enumerate([
+    ('января', 'январь', 'january', 'jan'), ('февраля', 'февраль', 'february', 'feb'),
+    ('марта', 'март', 'march', 'mar'), ('апреля', 'апрель', 'april', 'apr'),
+    ('мая', 'май', 'may'), ('июня', 'июнь', 'june', 'jun'),
+    ('июля', 'июль', 'july', 'jul'), ('августа', 'август', 'august', 'aug'),
+    ('сентября', 'сентябрь', 'september', 'sep'), ('октября', 'октябрь', 'october', 'oct'),
+    ('ноября', 'ноябрь', 'november', 'nov'), ('декабря', 'декабрь', 'december', 'dec'),
+], start=1):
+    for _form in _forms:
+        _MONTHS[_form] = _n
+# Longest first, so "мая" does not shadow "май" and "march" wins over "mar".
+_MONTH_NAMES_PATTERN = '|'.join(sorted(_MONTHS, key=len, reverse=True))
+
+
+def _query_timezone():
+    """Time zone for date phrases in queries: the machine's local zone."""
+    return datetime.now().astimezone().tzinfo
 
 
 class EnhancedPostgresStorage(PostgresStorage):
@@ -68,7 +91,7 @@ class EnhancedPostgresStorage(PostgresStorage):
                         try:
                             sys.stdout = open(os.devnull, 'w')
                             sys.stderr = open(os.devnull, 'w')
-                            model = BGEM3FlagModel(settings.EMBEDDING_MODEL, use_fp16=True)
+                            model = load_bge_m3(settings.EMBEDDING_MODEL, use_fp16=True)
                             return model
                         finally:
                             sys.stdout.close()
@@ -100,144 +123,91 @@ class EnhancedPostgresStorage(PostgresStorage):
         return embedding.tolist()
     
     def _preprocess_temporal_query(self, query_text: str) -> Tuple[str, Optional[Dict]]:
-        """Extract temporal markers from query and convert to metadata filters"""
-        clean_query = query_text
-        metadata_filter = None
-        
-        # Get current time in UTC with timezone awareness
-        from datetime import timezone
-        now = datetime.now(timezone.utc)
+        """Turn a date phrase in the query into a created_at filter.
+
+        Returns (query without the date phrase, filter or None). Days and periods
+        are taken in the machine's local time zone: "today" is the user's today.
+        Order matters: the most specific form wins (a full date before a month).
+        """
+        tz = _query_timezone()
+        now = datetime.now(tz)
         today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-        
-        logger.info("preprocessing_temporal_query", 
-                   query=query_text,
-                   current_time=now.isoformat())
-        
-        # Month name mapping (Russian and English)
-        month_map = {
-            'января': 1, 'january': 1, 'jan': 1,
-            'февраля': 2, 'february': 2, 'feb': 2,
-            'марта': 3, 'march': 3, 'mar': 3,
-            'апреля': 4, 'april': 4, 'apr': 4,
-            'мая': 5, 'may': 5,
-            'июня': 6, 'june': 6, 'jun': 6,
-            'июля': 7, 'july': 7, 'jul': 7,
-            'августа': 8, 'august': 8, 'aug': 8,
-            'сентября': 9, 'september': 9, 'sep': 9,
-            'октября': 10, 'october': 10, 'oct': 10,
-            'ноября': 11, 'november': 11, 'nov': 11,
-            'декабря': 12, 'december': 12, 'dec': 12,
-            # Also add nominative case (without 'я' at the end)
-            'октябрь': 10, 'сентябрь': 9, 'ноябрь': 11, 'декабрь': 12
-        }
-        
-        # Check for month + year patterns (e.g., "октябрь 2025", "October 2025")
-        month_year_pattern = r'(января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря|october|october|september|november|january|february|march|april|may|june|july|august|октябрь|сентябрь|ноябрь|декабрь)\s+(\d{4})'
-        match = re.search(month_year_pattern, query_text, re.IGNORECASE)
-        if match:
-            month_name = match.group(1).lower()
-            year = int(match.group(2))
-            month = month_map.get(month_name)
-            if month:
-                # Get first and last day of month (timezone-aware)
-                from datetime import timezone
-                _, last_day = calendar.monthrange(year, month)
-                start_date = datetime(year, month, 1, 0, 0, 0, tzinfo=timezone.utc)
-                end_date = datetime(year, month, last_day, 23, 59, 59, tzinfo=timezone.utc)
-                
-                metadata_filter = {
-                    'created_at': {
-                        '$gte': start_date,
-                        '$lte': end_date
-                    }
-                }
-                # Remove the month+year from query
-                clean_query = re.sub(month_year_pattern, '', query_text, flags=re.IGNORECASE).strip()
-                logger.info("month_year_found", month=month, year=year, start=start_date, end=end_date)
-                return clean_query, metadata_filter
-        
-        # Check for specific dates (e.g., "21 августа", "August 21")
-        date_patterns = [
-            r'(\d{1,2})\s+(января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря)',
-            r'(\d{1,2})\s+(january|february|march|april|may|june|july|august|september|october|november|december)',
-            r'(\d{4})-(\d{2})-(\d{2})',  # ISO format
-            r'(\d{2})\.(\d{2})\.(\d{4})'  # DD.MM.YYYY
+
+        def day_filter(year: int, month: int, day: int) -> Dict:
+            start = datetime(year, month, day, tzinfo=tz)
+            return {'created_at': {'$gte': start, '$lt': start + timedelta(days=1)}}
+
+        def month_filter(year: int, month: int) -> Dict:
+            _, last_day = calendar.monthrange(year, month)
+            return {'created_at': {
+                '$gte': datetime(year, month, 1, tzinfo=tz),
+                '$lte': datetime(year, month, last_day, 23, 59, 59, tzinfo=tz),
+            }}
+
+        def strip(pattern: str) -> str:
+            cleaned = re.sub(pattern, ' ', query_text, flags=re.IGNORECASE)
+            return re.sub(r'\s+', ' ', cleaned).strip()
+
+        months = _MONTH_NAMES_PATTERN
+        absolute = [
+            # 21 августа 2025 / 21 August 2025
+            (rf'\b(\d{{1,2}})\s+({months})\s+(\d{{4}})\b',
+             lambda m: day_filter(int(m[3]), _MONTHS[m[2].lower()], int(m[1]))),
+            # August 21, 2025 / August 21 2025
+            (rf'\b({months})\s+(\d{{1,2}}),?\s+(\d{{4}})\b',
+             lambda m: day_filter(int(m[3]), _MONTHS[m[1].lower()], int(m[2]))),
+            # 2025-10-03
+            (r'\b(\d{4})-(\d{2})-(\d{2})\b',
+             lambda m: day_filter(int(m[1]), int(m[2]), int(m[3]))),
+            # 03.10.2025
+            (r'\b(\d{1,2})\.(\d{1,2})\.(\d{4})\b',
+             lambda m: day_filter(int(m[3]), int(m[2]), int(m[1]))),
+            # октябрь 2025 / октября 2025 / October 2025
+            (rf'\b({months})\s+(\d{{4}})\b',
+             lambda m: month_filter(int(m[2]), _MONTHS[m[1].lower()])),
+            # 21 августа / 5 march (this year)
+            (rf'\b(\d{{1,2}})\s+({months})\b',
+             lambda m: day_filter(now.year, _MONTHS[m[2].lower()], int(m[1]))),
+            # March 5 (this year)
+            (rf'\b({months})\s+(\d{{1,2}})\b',
+             lambda m: day_filter(now.year, _MONTHS[m[1].lower()], int(m[2]))),
         ]
-        
-        for pattern in date_patterns:
+        for pattern, build in absolute:
             match = re.search(pattern, query_text, re.IGNORECASE)
-            if match:
-                try:
-                    if len(match.groups()) == 2 and match.group(2).isalpha():  # Day + Month name
-                        day = int(match.group(1))
-                        month_name = match.group(2).lower()
-                        month = month_map.get(month_name)
-                        if month:
-                            year = now.year
-                            from datetime import timezone
-                            date_obj = datetime(year, month, day, tzinfo=timezone.utc)
-                            metadata_filter = {
-                                'created_at': {
-                                    '$gte': date_obj.replace(hour=0, minute=0, second=0),
-                                    '$lt': (date_obj + timedelta(days=1)).replace(hour=0, minute=0, second=0)
-                                }
-                            }
-                            clean_query = re.sub(pattern, '', query_text, flags=re.IGNORECASE).strip()
-                            logger.info("specific_date_found", date=date_obj.date())
-                            break
-                except Exception as e:
-                    logger.warning("date_parsing_failed", pattern=pattern, error=str(e))
-        
-        # Define relative temporal patterns if no specific date found
-        if not metadata_filter:
-            temporal_patterns = {
-                r'\bсегодня\b|\btoday\b': {
-                    'created_at': {'$gte': today_start}
-                },
-                r'\bвчера\b|\byesterday\b': {
-                    'created_at': {
-                        '$gte': today_start - timedelta(days=1),
-                        '$lt': today_start
-                    }
-                },
-                r'\bэта неделя\b|\bthis week\b': {
-                    'created_at': {'$gte': today_start - timedelta(days=today_start.weekday())}
-                },
-                r'\bпрошлая неделя\b|\blast week\b': {
-                    'created_at': {
-                        '$gte': today_start - timedelta(days=today_start.weekday() + 7),
-                        '$lt': today_start - timedelta(days=today_start.weekday())
-                    }
-                },
-                r'\bэтот месяц\b|\bthis month\b': {
-                    'created_at': {'$gte': today_start.replace(day=1)}
-                },
-                r'\bпрошлый месяц\b|\blast month\b': {
-                    'created_at': {
-                        '$gte': (today_start.replace(day=1) - timedelta(days=1)).replace(day=1),
-                        '$lt': today_start.replace(day=1)
-                    }
-                }
-            }
-        
-            # Check for temporal markers
-            for pattern, filter_dict in temporal_patterns.items():
-                if re.search(pattern, query_text, re.IGNORECASE):
-                    metadata_filter = filter_dict
-                    # Remove temporal words from query for better semantic search
-                    clean_query = re.sub(pattern, '', query_text, flags=re.IGNORECASE).strip()
-                    logger.info("temporal_marker_found", 
-                               pattern=pattern,
-                               filter=filter_dict)
-                    break
-        
-        logger.info("temporal_preprocessing_result", 
-                    original_query=query_text,
-                    clean_query=clean_query,
-                    metadata_filter=metadata_filter)
-                    
-        return clean_query, metadata_filter
-    
+            if not match:
+                continue
+            try:
+                metadata_filter = build(match)
+            except (ValueError, KeyError):
+                continue  # e.g. 31.02.2025: not a date, keep looking
+            return strip(pattern), metadata_filter
+
+        week_start = today_start - timedelta(days=today_start.weekday())
+        month_start = today_start.replace(day=1)
+        relative = [
+            (r'\bпозавчера\b|\bday before yesterday\b',
+             {'created_at': {'$gte': today_start - timedelta(days=2),
+                             '$lt': today_start - timedelta(days=1)}}),
+            (r'\bсегодня\b|\btoday\b',
+             {'created_at': {'$gte': today_start}}),
+            (r'\bвчера\b|\byesterday\b',
+             {'created_at': {'$gte': today_start - timedelta(days=1), '$lt': today_start}}),
+            (r'\bэта неделя\b|\bна этой неделе\b|\bthis week\b',
+             {'created_at': {'$gte': week_start}}),
+            (r'\bпрошлая неделя\b|\bна прошлой неделе\b|\blast week\b',
+             {'created_at': {'$gte': week_start - timedelta(days=7), '$lt': week_start}}),
+            (r'\bэтот месяц\b|\bв этом месяце\b|\bthis month\b',
+             {'created_at': {'$gte': month_start}}),
+            (r'\bпрошлый месяц\b|\bв прошлом месяце\b|\blast month\b',
+             {'created_at': {'$gte': (month_start - timedelta(days=1)).replace(day=1),
+                             '$lt': month_start}}),
+        ]
+        for pattern, metadata_filter in relative:
+            if re.search(pattern, query_text, re.IGNORECASE):
+                return strip(pattern), metadata_filter
+
+        return query_text, None
+
     async def store_memory_enhanced(
         self,
         content: str,
@@ -261,9 +231,9 @@ class EnhancedPostgresStorage(PostgresStorage):
                     'intensity': affect.intensity
                 }
 
-        # Add time bucket
-        now = datetime.utcnow()
-        hour = now.hour
+        # Time-of-day bucket in the machine's local time: an MCP stdio server runs
+        # on the user's machine, and "morning" means the user's morning, not UTC's.
+        hour = datetime.now().astimezone().hour
         if 5 <= hour < 12:
             sashf_data['time_bucket'] = 'morning'
         elif 12 <= hour < 17:
@@ -319,6 +289,11 @@ class EnhancedPostgresStorage(PostgresStorage):
             # Check for patterns
             asyncio.create_task(self._check_patterns(memory_id, sashf_data))
 
+            # Keep tag catalog in sync (embed unseen tags, bump counts)
+            meta_tags = (metadata or {}).get('tags')
+            if isinstance(meta_tags, list):
+                asyncio.create_task(self._upsert_tag_embeddings(meta_tags))
+
             logger.info("stored_enhanced_memory",
                        memory_id=memory_id,
                        actors=sashf_data.get('actors'),
@@ -372,13 +347,6 @@ class EnhancedPostgresStorage(PostgresStorage):
             for pr in parent_rows:
                 parents_content[pr['id']] = dict(pr)
 
-        # Track chunk hit counts per parent for multi-chunk boost
-        chunk_hits: Dict[str, int] = {}
-        for r in results:
-            pid = r.get('parent_id')
-            if pid:
-                chunk_hits[pid] = chunk_hits.get(pid, 0) + 1
-
         for r in results:
             parent_id = r.get('parent_id')
             effective_id = parent_id if parent_id else r['id']
@@ -390,14 +358,10 @@ class EnhancedPostgresStorage(PostgresStorage):
                 continue
 
             if parent_id and parent_id in parents_content:
-                # Replace chunk with parent data but keep chunk's score
+                # Replace chunk with parent data but keep chunk's score.
+                # No multi-chunk bonus: long memories produce more chunks and
+                # would systematically outrank short focused ones.
                 parent = parents_content[parent_id]
-                base_sim = float(r.get('similarity', 0))
-
-                # Multi-chunk boost: if multiple chunks of same parent matched,
-                # boost by 2% per extra hit (caps at 10% boost)
-                hits = chunk_hits.get(parent_id, 1)
-                multi_chunk_boost = min(0.10, (hits - 1) * 0.02) if hits > 1 else 0.0
 
                 resolved[effective_id] = {
                     'id': parent['id'],
@@ -405,7 +369,7 @@ class EnhancedPostgresStorage(PostgresStorage):
                     'metadata': parent.get('metadata', r.get('metadata')),
                     'sashf': parent.get('sashf', r.get('sashf')),
                     'created_at': parent.get('created_at', r.get('created_at')),
-                    'similarity': base_sim + multi_chunk_boost,
+                    'similarity': float(r.get('similarity', 0)),
                     'resolved_from_chunk': True,
                 }
             else:
@@ -423,16 +387,25 @@ class EnhancedPostgresStorage(PostgresStorage):
         limit: int = 10,
         use_graph: bool = True,
         graph_depth: int = 2,
-        min_similarity: float = 0.15
+        min_similarity: Optional[float] = None
     ) -> List[Dict]:
         """
-        ПРАВИЛЬНАЯ АРХИТЕКТУРА ПОИСКА:
-        1. Semantic search (vector similarity) - PRIMARY
-        2. Keyword fallback (ts_rank) - only if semantic fails
-        3. Graph expansion - on top results
-        
-        NOW WITH TEMPORAL FILTERING!
+        Search pipeline:
+        1. Semantic search: vector similarity over chunks, resolved to parents.
+        2. Keyword search: PostgreSQL FTS (ts_rank_cd), always on, not a fallback.
+        3. Tag catalog: the query embedding is matched against embeddings of
+           metadata tags; the top tags expand into their memories.
+        4. Reciprocal Rank Fusion of the three ranked lists. Dense scores are
+           too compressed (mostly ~0.7-0.8) for an absolute threshold to work,
+           so only ranks are fused.
+        5. Metadata/tag match and graph expansion on top of the fused list,
+           then a recency blend.
+
+        Temporal markers in the query ("yesterday", "last week", "October 2025")
+        become date filters on all engines.
         """
+        if min_similarity is None:
+            min_similarity = settings.MIN_SIMILARITY
         
         # STEP 0: INTENT DETECTION & TEMPORAL PREPROCESSING
         intent, intent_context = self.intent_detector.detect_intent(query)
@@ -519,14 +492,39 @@ class EnhancedPostgresStorage(PostgresStorage):
             # Use cleaned query for semantic/keyword search
             search_query = clean_query if clean_query else query
             
+            # Helper to build temporal WHERE clauses (used by all engines below)
+            def _temporal_clauses(param_count, params_list):
+                parts = []
+                if temporal_filter and 'created_at' in temporal_filter:
+                    date_filter = temporal_filter['created_at']
+                    if '$gte' in date_filter:
+                        parts.append(f'AND created_at >= ${param_count}')
+                        params_list.append(date_filter['$gte'])
+                        param_count += 1
+                    if '$lt' in date_filter:
+                        parts.append(f'AND created_at < ${param_count}')
+                        params_list.append(date_filter['$lt'])
+                        param_count += 1
+                    if '$lte' in date_filter:
+                        parts.append(f'AND created_at <= ${param_count}')
+                        params_list.append(date_filter['$lte'])
+                        param_count += 1
+                return parts, param_count
+
+            # Both the semantic and the tag engine need the query embedding; compute it once.
+            embedding_array = None
+            try:
+                query_embedding = await self.encode_text(search_query)
+                embedding_array = np.array(query_embedding, dtype=np.float32)
+            except Exception as e:
+                logger.error("query_encoding_error", error=str(e))
+
             # STEP 1: SEMANTIC SEARCH (PRIMARY)
             error_msg = None
             try:
-                # Generate query embedding
-                query_embedding = await self.encode_text(search_query)
-                # Pass as numpy array directly to pgvector
-                embedding_array = np.array(query_embedding, dtype=np.float32)
-                
+                if embedding_array is None:
+                    raise RuntimeError("query embedding unavailable")
+
                 # Build dynamic query with temporal filters
                 query_parts = ["""
                     SELECT
@@ -577,115 +575,126 @@ class EnhancedPostgresStorage(PostgresStorage):
             except Exception as e:
                 error_msg = f"Semantic search failed: {str(e)}"
                 logger.error("semantic_search_error", error=str(e))
-                # Don't re-raise, fallback to keyword search
+                # Don't re-raise, keyword search still runs below
                 results = []
-            
-            # STEP 2: KEYWORD FALLBACK (if semantic gave poor results)
-            if not results or (results and max(float(r.get('similarity', 0)) for r in results) < settings.KEYWORD_FALLBACK_THRESHOLD):
-                logger.info("using_keyword_fallback", 
-                           semantic_count=len(results),
-                           max_semantic_score=max(float(r.get('similarity', 0)) for r in results) if results else 0)
-                
-                # Detect language for FTS config: Latin-only → 'english', otherwise → 'russian'
-                fts_config = 'english' if re.match(r'^[a-zA-Z0-9\s\-_.]+$', search_query) else 'russian'
 
-                # Build dynamic keyword query with temporal filters
-                keyword_query_parts = [f"""
-                    SELECT
-                        id,
-                        content,
-                        metadata,
-                        sashf,
-                        created_at,
-                        parent_id,
-                        chunk_index,
-                        ts_rank_cd(to_tsvector('{fts_config}', content),
-                                  plainto_tsquery('{fts_config}', $1)) as similarity
-                    FROM memories
-                    WHERE to_tsvector('{fts_config}', content) @@ plainto_tsquery('{fts_config}', $1)
-                    AND parent_id IS NULL
-                """]
-                keyword_params = [search_query]
-                keyword_param_count = 2
-                
-                # Add temporal filters if present
-                if temporal_filter and 'created_at' in temporal_filter:
-                    date_filter = temporal_filter['created_at']
-                    if '$gte' in date_filter:
-                        keyword_query_parts.append(f'AND created_at >= ${keyword_param_count}')
-                        keyword_params.append(date_filter['$gte'])
-                        keyword_param_count += 1
-                    if '$lt' in date_filter:
-                        keyword_query_parts.append(f'AND created_at < ${keyword_param_count}')
-                        keyword_params.append(date_filter['$lt'])
-                        keyword_param_count += 1
-                    if '$lte' in date_filter:
-                        keyword_query_parts.append(f'AND created_at <= ${keyword_param_count}')
-                        keyword_params.append(date_filter['$lte'])
-                        keyword_param_count += 1
-                
-                keyword_query_parts.append(f'ORDER BY similarity DESC LIMIT ${keyword_param_count}')
-                keyword_params.append(limit)
-                
-                full_keyword_query = '\n'.join(keyword_query_parts)
-                keyword_results = await conn.fetch(full_keyword_query, *keyword_params)
+            # STEP 1.5: RESOLVE CHUNKS TO PARENTS before fusion, so both
+            # engines rank the same units (parent memories, not chunks)
+            semantic_ranked = await self._resolve_to_parents(results, conn)
 
-                # Normalize keyword scores (ts_rank_cd returns [0, 32+], cosine is [0, 1])
-                keyword_dict = {}
-                if keyword_results:
-                    kw_scores = [float(r['similarity']) for r in keyword_results]
-                    kw_min, kw_max = min(kw_scores), max(kw_scores)
-                    for r in keyword_results:
-                        d = dict(r)
-                        if kw_max > kw_min:
-                            d['similarity'] = (float(d['similarity']) - kw_min) / (kw_max - kw_min)
-                        else:
-                            d['similarity'] = 1.0  # single result = best
-                        keyword_dict[d['id']] = d
+            # STEP 2: KEYWORD SEARCH (always on — RRF fusion, not fallback)
+            # Detect language for FTS config: Latin-only → 'english', otherwise → 'russian'
+            fts_config = 'english' if re.match(r'^[a-zA-Z0-9\s\-_.]+$', search_query) else 'russian'
 
-                # Merge with semantic results
-                for r in results:
-                    if r['id'] in keyword_dict:
-                        # Boost score if found by both methods
-                        r['similarity'] = float(r['similarity']) * settings.SEMANTIC_WEIGHT + float(keyword_dict[r['id']]['similarity']) * settings.KEYWORD_WEIGHT
-                        del keyword_dict[r['id']]
+            # OR semantics: plainto_tsquery ANDs all words and kills recall on
+            # multi-word queries (a document must contain every word). Fusion only
+            # needs a ranked list, and ts_rank_cd already ranks documents with
+            # more matching words higher.
+            keyword_query_parts = [f"""
+                WITH q AS (
+                    SELECT replace(plainto_tsquery('{fts_config}', $1)::text,
+                                   ' & ', ' | ')::tsquery AS tsq
+                )
+                SELECT
+                    id,
+                    content,
+                    metadata,
+                    sashf,
+                    created_at,
+                    parent_id,
+                    chunk_index,
+                    ts_rank_cd(to_tsvector('{fts_config}', content), q.tsq) as similarity
+                FROM memories, q
+                WHERE to_tsvector('{fts_config}', content) @@ q.tsq
+                AND parent_id IS NULL
+            """]
+            keyword_params = [search_query]
+            keyword_param_count = 2
 
-                # Add remaining keyword results
-                for kr in keyword_dict.values():
-                    results.append(kr)
-                
-                search_method = "hybrid" if results else "keyword"
+            # Add temporal filters if present
+            if temporal_filter and 'created_at' in temporal_filter:
+                date_filter = temporal_filter['created_at']
+                if '$gte' in date_filter:
+                    keyword_query_parts.append(f'AND created_at >= ${keyword_param_count}')
+                    keyword_params.append(date_filter['$gte'])
+                    keyword_param_count += 1
+                if '$lt' in date_filter:
+                    keyword_query_parts.append(f'AND created_at < ${keyword_param_count}')
+                    keyword_params.append(date_filter['$lt'])
+                    keyword_param_count += 1
+                if '$lte' in date_filter:
+                    keyword_query_parts.append(f'AND created_at <= ${keyword_param_count}')
+                    keyword_params.append(date_filter['$lte'])
+                    keyword_param_count += 1
 
-            # STEP 2.5: METADATA/TAGS SEARCH (dynamic scoring)
-            # Two-tier: exact tag match (0.8) and substring in metadata (0.5)
-            logger.info("searching_metadata_tags", query=search_query)
+            keyword_query_parts.append(f'ORDER BY similarity DESC LIMIT ${keyword_param_count}')
+            keyword_params.append(limit * 3)  # deeper rank list for fusion
 
-            existing_ids = {r['id'] for r in results}
-            metadata_added = 0
+            full_keyword_query = '\n'.join(keyword_query_parts)
+            try:
+                keyword_rows = await conn.fetch(full_keyword_query, *keyword_params)
+                keyword_ranked = [dict(r) for r in keyword_rows]
+            except Exception as e:
+                logger.error("keyword_search_error", error=str(e))
+                keyword_ranked = []
 
-            # Helper to build temporal WHERE clauses
-            def _temporal_clauses(param_count, params_list):
-                parts = []
-                if temporal_filter and 'created_at' in temporal_filter:
-                    date_filter = temporal_filter['created_at']
-                    if '$gte' in date_filter:
-                        parts.append(f'AND created_at >= ${param_count}')
-                        params_list.append(date_filter['$gte'])
-                        param_count += 1
-                    if '$lt' in date_filter:
-                        parts.append(f'AND created_at < ${param_count}')
-                        params_list.append(date_filter['$lt'])
-                        param_count += 1
-                    if '$lte' in date_filter:
-                        parts.append(f'AND created_at <= ${param_count}')
-                        params_list.append(date_filter['$lte'])
-                        param_count += 1
-                return parts, param_count
+            # STEP 2.1: TAG ENGINE (catalog). The query is matched against the tag
+            # vocabulary (short-to-short: the symmetric case where a bi-encoder
+            # works well); the top tags expand into memories. Catches anchors that
+            # live only in metadata (a project name in the tags but not in the text).
+            tag_ranked = []
+            if embedding_array is not None:
+                try:
+                    tag_rows = await conn.fetch(f"""
+                        SELECT tag, 1.0 - (embedding <=> $1) AS sim
+                        FROM tag_embeddings
+                        WHERE embedding IS NOT NULL
+                        ORDER BY embedding <=> $1
+                        LIMIT {int(settings.TAG_TOP_K)}
+                    """, embedding_array)
+                    matched_tags = {r['tag']: float(r['sim']) for r in tag_rows
+                                    if float(r['sim']) >= settings.TAG_MIN_SIMILARITY}
+                    if matched_tags:
+                        logger.info("tag_engine_matched", tags=matched_tags)
+                        tag_mem_parts = ["""
+                            SELECT m.id, m.content, m.metadata, m.sashf, m.created_at,
+                                   m.parent_id, m.chunk_index,
+                                   max(ts.sim) AS similarity
+                            FROM memories m
+                            JOIN LATERAL jsonb_array_elements_text(
+                                CASE WHEN jsonb_typeof(m.metadata->'tags') = 'array'
+                                     THEN m.metadata->'tags' ELSE '[]'::jsonb END
+                            ) AS t(tag) ON TRUE
+                            JOIN unnest($1::text[], $2::float8[]) AS ts(tag, sim)
+                              ON ts.tag = lower(t.tag)
+                            WHERE m.parent_id IS NULL
+                        """]
+                        tag_mem_params = [list(matched_tags.keys()), list(matched_tags.values())]
+                        tag_pc = 3
+                        t_parts, tag_pc = _temporal_clauses(tag_pc, tag_mem_params)
+                        tag_mem_parts.extend(t_parts)
+                        tag_mem_parts.append(f"""
+                            GROUP BY m.id, m.content, m.metadata, m.sashf, m.created_at,
+                                     m.parent_id, m.chunk_index
+                            ORDER BY similarity DESC, m.created_at DESC
+                            LIMIT ${tag_pc}
+                        """)
+                        tag_mem_params.append(limit * 3)
+                        tag_mem_rows = await conn.fetch('\n'.join(tag_mem_parts), *tag_mem_params)
+                        tag_ranked = [dict(r) for r in tag_mem_rows]
+                except Exception as e:
+                    logger.error("tag_engine_error", error=str(e))
 
-            # 2.5a: Exact tag match (score = 0.8)
+            # STEP 2.1b: METADATA MATCHES as two more ranked lists for RRF
+            # (exact tag match; query as a substring of the metadata JSON), newest
+            # first. They used to be appended after fusion with fixed scores of
+            # 0.8 / 0.5, which sat on a different scale from the fused (0, 1] scores
+            # and could outrank direct matches.
+            tag_exact_ranked: List[Dict] = []
+            metadata_ranked: List[Dict] = []
+
             tag_query_parts = ["""
-                SELECT id, content, metadata, sashf, created_at, parent_id, chunk_index,
-                       0.8 as similarity
+                SELECT id, content, metadata, sashf, created_at, parent_id, chunk_index
                 FROM memories
                 WHERE metadata->'tags' ? $1
                 AND parent_id IS NULL
@@ -697,39 +706,52 @@ class EnhancedPostgresStorage(PostgresStorage):
             tag_query_parts.append(f'ORDER BY created_at DESC LIMIT ${tag_pc}')
             tag_params.append(limit)
             try:
-                tag_results = await conn.fetch('\n'.join(tag_query_parts), *tag_params)
-                for mr in tag_results:
-                    if mr['id'] not in existing_ids:
-                        results.append(dict(mr))
-                        existing_ids.add(mr['id'])
-                        metadata_added += 1
+                tag_exact_ranked = [dict(r) for r in
+                                    await conn.fetch('\n'.join(tag_query_parts), *tag_params)]
             except Exception:
-                pass  # tags column may not exist as jsonb array
+                pass  # metadata->'tags' may not be a JSON array
 
-            # 2.5b: Substring match in metadata (score = 0.5)
+            # Escape LIKE wildcards so '%' and '_' in the query match literally.
+            like_query = (search_query.replace('\\', '\\\\')
+                          .replace('%', '\\%').replace('_', '\\_'))
             sub_query_parts = ["""
-                SELECT id, content, metadata, sashf, created_at, parent_id, chunk_index,
-                       0.5 as similarity
+                SELECT id, content, metadata, sashf, created_at, parent_id, chunk_index
                 FROM memories
-                WHERE metadata::text ILIKE $1
+                WHERE metadata::text ILIKE $1 ESCAPE '\\'
                 AND parent_id IS NULL
             """]
-            sub_params = [f'%{search_query}%']
+            sub_params = [f'%{like_query}%']
             sub_pc = 2
             temporal_parts2, sub_pc = _temporal_clauses(sub_pc, sub_params)
             sub_query_parts.extend(temporal_parts2)
             sub_query_parts.append(f'ORDER BY created_at DESC LIMIT ${sub_pc}')
             sub_params.append(limit)
-            sub_results = await conn.fetch('\n'.join(sub_query_parts), *sub_params)
-            for mr in sub_results:
-                if mr['id'] not in existing_ids:
-                    results.append(dict(mr))
-                    existing_ids.add(mr['id'])
-                    metadata_added += 1
+            metadata_ranked = [dict(r) for r in
+                               await conn.fetch('\n'.join(sub_query_parts), *sub_params)]
 
-            if metadata_added > 0:
-                logger.info("metadata_search_added", count=metadata_added)
-                search_method = "hybrid+metadata"
+            # STEP 2.2: RECIPROCAL RANK FUSION
+            # ts_rank, cosine and tag similarity live on incomparable scales, so
+            # only ranks are fused. Scores are normalised to (0, 1] so downstream
+            # scoring (recency blend, metadata 0.8/0.5, graph cap at 0.8*max)
+            # keeps its scale.
+            engine_lists = [(name, lst) for name, lst in
+                            (('semantic', semantic_ranked),
+                             ('keyword', keyword_ranked),
+                             ('tags', tag_ranked),
+                             ('tag_exact', tag_exact_ranked),
+                             ('metadata', metadata_ranked)) if lst]
+            results = rrf_fuse(engine_lists, k=settings.RRF_K)
+
+            if len(engine_lists) > 1:
+                search_method = "rrf_hybrid"
+            elif engine_lists:
+                search_method = engine_lists[0][0]
+
+            logger.info("rrf_fusion_complete",
+                       semantic_count=len(semantic_ranked),
+                       keyword_count=len(keyword_ranked),
+                       tag_count=len(tag_ranked),
+                       fused_count=len(results))
 
             # STEP 2.9: RESOLVE CHUNKS TO PARENTS
             # Before graph expansion, collapse chunk results into parent records
@@ -745,27 +767,32 @@ class EnhancedPostgresStorage(PostgresStorage):
                 for start_id in top_ids:
                     graph_results = await conn.fetch("""
                         WITH RECURSIVE graph AS (
-                            SELECT m.id, m.content, m.metadata, m.sashf, 0 as depth, 1.0::float8 as weight
+                            SELECT m.id, m.content, m.metadata, m.sashf, m.created_at,
+                                   0 as depth, 1.0::float8 as weight
                             FROM memories m
                             WHERE m.id = $1
                             AND m.parent_id IS NULL
 
                             UNION ALL
 
-                            SELECT m.id, m.content, m.metadata, m.sashf, g.depth + 1,
+                            SELECT m.id, m.content, m.metadata, m.sashf, m.created_at, g.depth + 1,
                                    (g.weight * ml.weight * 0.8)::float8
                             FROM graph g
-                            JOIN memory_links ml ON g.id = ml.from_id
-                            JOIN memories m ON ml.to_id = m.id
+                            -- Links are stored once (e.g. 'after': newer -> earlier) but walked
+                            -- in both directions, so a hit reaches both what came before it
+                            -- and what came after it.
+                            JOIN memory_links ml ON g.id IN (ml.from_id, ml.to_id)
+                            JOIN memories m ON m.id = CASE WHEN ml.from_id = g.id
+                                                           THEN ml.to_id ELSE ml.from_id END
                             WHERE g.depth < $2
                             AND ml.link_type IN ('similar', 'after', 'caused_by')
                             AND m.parent_id IS NULL
                         )
-                        SELECT DISTINCT id, content, metadata, sashf,
+                        SELECT DISTINCT id, content, metadata, sashf, created_at,
                                MIN(depth) as depth, MAX(weight) as weight
                         FROM graph
                         WHERE depth > 0
-                        GROUP BY id, content, metadata, sashf
+                        GROUP BY id, content, metadata, sashf, created_at
                         ORDER BY weight DESC
                         LIMIT 5
                     """, start_id, graph_depth)
@@ -781,8 +808,9 @@ class EnhancedPostgresStorage(PostgresStorage):
                         except (json.JSONDecodeError, TypeError):
                             pass
 
-                        # Scale graph weight relative to semantic results
-                        # Graph results should enhance, not dominate - cap at 80% of max semantic
+                        # Graph neighbours are capped at 80% of the best direct score.
+                        # They can outrank weaker direct matches; capping them below
+                        # every direct match would push them out of any top-N.
                         scaled_similarity = float(gr['weight']) * max_semantic_sim * 0.8
                         results.append({
                             'id': gr['id'],
@@ -790,13 +818,14 @@ class EnhancedPostgresStorage(PostgresStorage):
                             'similarity': scaled_similarity,
                             'metadata': gr['metadata'],
                             'sashf': gr['sashf'],
+                            'created_at': gr['created_at'],  # so the recency blend applies
                             'source': 'graph'  # Mark as graph-expanded
                         })
 
             # De-duplicate and apply recency boost
             seen = set()
             unique_results = []
-            now = datetime.utcnow()
+            now = datetime.now(timezone.utc)
 
             for r in results:
                 if r['id'] not in seen:
@@ -814,14 +843,9 @@ class EnhancedPostgresStorage(PostgresStorage):
 
                         # Make created timezone-aware if it isn't
                         if created.tzinfo is None:
-                            from datetime import timezone
                             created = created.replace(tzinfo=timezone.utc)
 
-                        # Make now timezone-aware
-                        from datetime import timezone
-                        now_aware = now.replace(tzinfo=timezone.utc)
-
-                        days_old = (now_aware - created).days
+                        days_old = (now - created).days
                         # Boost newer memories: e^(-days/30) gives 1.0 for today, 0.36 for 30 days
                         recency_boost = np.exp(-days_old / 30.0)
 
@@ -861,7 +885,41 @@ class EnhancedPostgresStorage(PostgresStorage):
             
             return unique_results[:limit]
     
-    # ... остальные методы без изменений ...
+    async def _upsert_tag_embeddings(self, tags: List[str]):
+        """Sync the tag catalog: embed unseen tags, increment counters.
+
+        Tags are normalised with lower(), as in build_tag_index.py and the tag
+        search engine.
+        """
+        try:
+            norm = sorted({t.strip().lower() for t in tags
+                           if isinstance(t, str) and t.strip()})
+            if not norm:
+                return
+            async with self.pool.acquire() as conn:
+                known = {r['tag'] for r in await conn.fetch(
+                    "SELECT tag FROM tag_embeddings WHERE tag = ANY($1)", norm)}
+
+                seen = [t for t in norm if t in known]
+                if seen:
+                    await conn.execute("""
+                        UPDATE tag_embeddings
+                        SET memory_count = memory_count + 1, updated_at = now()
+                        WHERE tag = ANY($1)
+                    """, seen)
+
+                for tag in (t for t in norm if t not in known):
+                    emb = await self.encode_text(tag)
+                    await conn.execute("""
+                        INSERT INTO tag_embeddings (tag, embedding, memory_count)
+                        VALUES ($1, $2, 1)
+                        ON CONFLICT (tag) DO UPDATE
+                        SET memory_count = tag_embeddings.memory_count + 1,
+                            updated_at = now()
+                    """, tag, np.array(emb, dtype=np.float32))
+        except Exception as e:
+            logger.error("tag_upsert_error", error=str(e))
+
     async def _auto_link_memory(self, memory_id: str):
         """Automatically create links for new memory"""
         try:
@@ -896,24 +954,9 @@ class EnhancedPostgresStorage(PostgresStorage):
                                    memory_id=memory_id, 
                                    linked_count=len(similar))
                 
-                recent = await conn.fetch("""
-                    SELECT id, created_at
-                    FROM memories
-                    WHERE id != $1
-                    AND parent_id IS NULL
-                    AND created_at > NOW() - INTERVAL '24 hours'
-                    AND created_at < (SELECT created_at FROM memories WHERE id = $1)
-                    ORDER BY created_at DESC
-                    LIMIT 5
-                """, memory_id)
-                
-                for rec in recent:
-                    await conn.execute("""
-                        INSERT INTO memory_links (from_id, to_id, link_type, weight, confidence)
-                        VALUES ($1, $2, 'after', 0.7, 0.7)
-                        ON CONFLICT DO NOTHING
-                    """, rec['id'], memory_id)
-                    
+                # Temporal 'after' links are created by the auto_temporal_links
+                # trigger (migration 002), not here.
+
         except Exception as e:
             logger.error("auto_link_failed", error=str(e), memory_id=memory_id)
     
@@ -1081,22 +1124,6 @@ class EnhancedPostgresStorage(PostgresStorage):
             
             patterns = await conn.fetch(query, *params)
             return [dict(p) for p in patterns]
-    
-    async def promote_pattern(self, pattern_id: str) -> bool:
-        """Mark a pattern as important/promoted"""
-        try:
-            async with self.pool.adjust() as conn:
-                await conn.execute("""
-                    UPDATE memory_patterns
-                    SET promoted = true, confidence = 1.0
-                    WHERE id = $1
-                """, pattern_id)
-                
-                logger.info("pattern_promoted", pattern_id=pattern_id)
-                return True
-        except Exception as e:
-            logger.error("pattern_promote_failed", error=str(e))
-            return False
     
     async def get_graph_stats(self) -> Dict:
         """Get graph statistics"""

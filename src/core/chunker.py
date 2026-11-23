@@ -5,7 +5,7 @@ Pure module with no DB dependencies.
 """
 import re
 from dataclasses import dataclass
-from typing import List
+from typing import List, Optional
 
 from config.settings import settings
 
@@ -25,9 +25,9 @@ def needs_chunking(content: str) -> bool:
 
 def chunk_text(
     content: str,
-    max_size: int = 0,
-    overlap: int = 0,
-    min_size: int = 0,
+    max_size: Optional[int] = None,
+    overlap: Optional[int] = None,
+    min_size: Optional[int] = None,
 ) -> List[Chunk]:
     """Split content into chunks. Returns empty list if chunking not needed.
 
@@ -37,10 +37,15 @@ def chunk_text(
     3. If still > max_size → split by paragraph (\\n\\n)
     4. Last resort → split by sentences
     5. Overlap: prepend last ~overlap chars from previous chunk
+
+    None means "use the setting"; overlap=0 disables overlap. A segment shorter
+    than min_size is merged into the previous chunk, or, if it comes first, into
+    the next one, so no text is lost. char_offset is the position of the chunk's
+    own text (without the overlap prefix) in the original content.
     """
-    max_size = max_size or settings.CHUNK_MAX_SIZE
-    overlap = overlap or settings.CHUNK_OVERLAP
-    min_size = min_size or settings.CHUNK_MIN_SIZE
+    max_size = settings.CHUNK_MAX_SIZE if max_size is None else max_size
+    overlap = settings.CHUNK_OVERLAP if overlap is None else overlap
+    min_size = settings.CHUNK_MIN_SIZE if min_size is None else min_size
 
     if len(content) <= max_size:
         return []
@@ -49,30 +54,44 @@ def chunk_text(
 
     # Build chunks with overlap
     chunks: List[Chunk] = []
-    offset = 0
+    search_from = 0
     prev_tail = ""
+    pending = ""          # a too-small leading segment, carried into the next chunk
+    pending_offset = 0
 
-    for i, segment in enumerate(raw_segments):
+    for segment in raw_segments:
         segment = segment.strip()
-        if not segment or len(segment) < min_size:
-            # Too small — merge with previous chunk if possible
+        if not segment:
+            continue
+        found = content.find(segment, search_from)
+        position = found if found >= 0 else search_from
+        search_from = position + len(segment)
+
+        if len(segment) < min_size:
             if chunks:
-                chunks[-1] = Chunk(
-                    index=chunks[-1].index,
-                    text=chunks[-1].text + "\n\n" + segment,
-                    char_offset=chunks[-1].char_offset,
-                )
-            offset += len(segment)
+                chunks[-1].text = chunks[-1].text + "\n\n" + segment
+            elif pending:
+                pending = pending + "\n\n" + segment
+            else:
+                pending, pending_offset = segment, position
             continue
 
-        if i > 0 and prev_tail:
+        if pending:
+            segment = pending + "\n\n" + segment
+            position = pending_offset
+            pending = ""
+
+        if chunks and prev_tail:
             chunk_text_val = f"...{prev_tail}\n\n{segment}"
         else:
             chunk_text_val = segment
 
-        chunks.append(Chunk(index=len(chunks), text=chunk_text_val, char_offset=offset))
-        prev_tail = segment[-overlap:] if len(segment) > overlap else segment
-        offset += len(segment)
+        chunks.append(Chunk(index=len(chunks), text=chunk_text_val, char_offset=position))
+        if overlap > 0:
+            prev_tail = segment[-overlap:] if len(segment) > overlap else segment
+
+    if pending:  # every segment was too small: keep the text as one chunk
+        chunks.append(Chunk(index=len(chunks), text=pending, char_offset=pending_offset))
 
     # Re-index after possible merges
     for i, chunk in enumerate(chunks):

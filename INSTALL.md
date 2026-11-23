@@ -1,114 +1,69 @@
-# Memory Nexus -- Installation Guide
+# Installing Memory Nexus without Docker
 
-## Requirements
+The README's quick start uses the `pgvector/pgvector` image. This page covers a
+native PostgreSQL and the problems people actually hit.
 
-- Python 3.11+
-- PostgreSQL 14+ with pgvector extension
-- ~500MB disk space (embedding model download)
+## PostgreSQL with pgvector
 
-## 1. Install dependencies
-
-```bash
-cd memory-nexus-v2
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-```
-
-## 2. Set up PostgreSQL
-
-### macOS (Homebrew)
-```bash
-brew install postgresql@14
-brew services start postgresql@14
-```
-
-### Ubuntu/Debian
-```bash
-sudo apt install postgresql postgresql-contrib
-sudo systemctl start postgresql
-```
-
-### Create database
+macOS (Homebrew):
 
 ```bash
+brew install postgresql@16 pgvector
+brew services start postgresql@16
 createdb memory_nexus
-psql memory_nexus -c "CREATE EXTENSION IF NOT EXISTS vector;"
-psql memory_nexus -c "CREATE EXTENSION IF NOT EXISTS \"uuid-ossp\";"
 ```
 
-## 3. Configure
+Debian/Ubuntu (PGDG packages):
 
 ```bash
-cp .env.example .env
+sudo apt install postgresql-16 postgresql-16-pgvector
+sudo -u postgres createdb memory_nexus
 ```
 
-Edit `.env` with your database credentials. Key fields:
+You do not need to create extensions by hand: migration 001 runs
+`CREATE EXTENSION IF NOT EXISTS vector` and `"uuid-ossp"`, which requires a role
+allowed to create extensions (the database owner on PostgreSQL 13+ for trusted
+extensions, otherwise a superuser) for the first `init_db.py`.
 
-```bash
-DATABASE_URL=postgresql://postgres:password@localhost:5432/memory_nexus
+Check the pgvector version (HNSW needs 0.5.0 or newer):
+
+```sql
+SELECT extversion FROM pg_extension WHERE extname = 'vector';
 ```
 
-Or set individual `PG_*` variables in `.env` (see `config/settings.py` for all options).
-
-## 4. Initialize database
+## Python
 
 ```bash
+python3.11 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt          # requirements-dev.txt for tests
+cp .env.example .env                     # PG_* settings
 python init_db.py
 ```
 
-This creates all tables, indexes, triggers, and applies migrations (001-003).
-
-## 5. Add to Claude Desktop
-
-Edit `~/Library/Application Support/Claude/claude_desktop_config.json`:
-
-```json
-{
-  "mcpServers": {
-    "memory-nexus": {
-      "command": "python3",
-      "args": ["/absolute/path/to/memory-nexus-v2/run_sashf_server.py"],
-      "env": {
-        "PYTHONPATH": "/absolute/path/to/memory-nexus-v2"
-      }
-    }
-  }
-}
-```
-
-Use absolute paths. No `~` or relative paths.
-
-Restart Claude Desktop.
-
-## 6. Verify
-
-After restart, the following MCP tools should appear:
-- `store_memory`
-- `search_memories_enhanced`
-- `get_recent_memories`
-- `get_memory_stats`
-- `get_patterns`
-
 ## Troubleshooting
 
-### "Module not found" errors
-Ensure `PYTHONPATH` in Claude Desktop config points to the repository root.
+**`init_db.py` cannot connect.** It uses the same `PG_*` settings as the server,
+from the environment or `.env` in the repository root. It prints the target as
+`user@host:port/db` without the password.
 
-### PostgreSQL connection failed
-Check `.env` has correct credentials and PostgreSQL is running:
+**Migration 005 stops with "cannot be cast to vector(1024)".** The database was
+created by an older version with 384-dimensional vectors. The message contains
+the exact steps: clear the old vectors, re-run `init_db.py`, then
+`reembed_all.py` and `build_tag_index.py --rebuild`.
+
+**The first search is slow, or fails without network.** BGE-M3 is downloaded from
+Hugging Face on first use (about 4.3 GB). Pre-download it once:
+
 ```bash
-psql -U postgres -d memory_nexus -c "SELECT 1;"
+python -c "from FlagEmbedding import BGEM3FlagModel; BGEM3FlagModel('BAAI/bge-m3')"
 ```
 
-### Embedding model download slow
-First run downloads ~1.2GB model. Pre-download:
-```bash
-python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('intfloat/multilingual-e5-large')"
-```
+For offline machines, copy the Hugging Face cache and set `HF_HUB_OFFLINE=1`.
 
-### Claude Desktop doesn't show the server
-1. Check logs: `~/Library/Logs/Claude/mcp*.log`
-2. Verify JSON syntax in config
-3. Ensure absolute paths
-4. Try running manually: `python run_sashf_server.py`
+**The MCP client does not show the server.** Run it by hand to see the error:
+`.venv/bin/python run_sashf_server.py` (it waits for JSON-RPC on stdin; Ctrl-C to
+stop). Claude Desktop logs are in `~/Library/Logs/Claude/mcp*.log` on macOS. Use
+absolute paths in the client configuration.
+
+**Anything printed to stdout breaks the MCP protocol.** If you add code, log to
+stderr. The storage layer routes `structlog` to stderr for this reason.

@@ -93,7 +93,7 @@ class SASHFParser:
             'внимательно', 'рассеянно', 'нежно', 'грубо', 'осторожно',
             'смело', 'робко', 'уверенно', 'неуверенно', 'спокойно',
             'взволнованно', 'радостно', 'грустно', 'яростно', 'лениво',
-            'устало', 'терпеливо', 'игриво'  # Добавляю больше manner слов
+            'устало', 'терпеливо', 'игриво'  # Additional manner words
         }
     
     def _init_qualia_patterns(self):
@@ -114,7 +114,7 @@ class SASHFParser:
         doc.tag_morph(self.morph_tagger)
         doc.tag_ner(self.ner_tagger)
         
-        # Лемматизация
+        # Lemmatization
         for token in doc.tokens:
             token.lemmatize(self.morph_vocab)
         
@@ -182,11 +182,7 @@ class SASHFParser:
                     # Remove common endings
                     for ending in ['ла', 'ли', 'ет', 'ют', 'ит', 'ят', 'ал', 'ала', 'али', 'ула']:
                         if text.endswith(ending) and len(text) > len(ending) + 2:
-                            base = text[:-len(ending)]
-                            # Special cases
-                            if base == 'вздохн':
-                                return 'вздохнуть'
-                            return base
+                            return text[:-len(ending)]
                     return text
         
         return None
@@ -196,9 +192,11 @@ class SASHFParser:
         # Check text for manner words
         text_lower = doc.text.lower()
         
-        for manner in self.manner_words:
-            if manner in text_lower:
-                return manner
+        # Deterministic: the manner word that occurs first in the text (iterating
+        # the set directly would depend on PYTHONHASHSEED).
+        found = [(text_lower.find(m), m) for m in self.manner_words if m in text_lower]
+        if found:
+            return min(found)[1]
         
         # Also check tokens
         for token in doc.tokens:
@@ -256,10 +254,6 @@ class SASHFParser:
         if 'вздох' in text:
             arousal_score -= 0.2
             
-        # "марафон" indicates high effort
-        if 'марафон' in text:
-            arousal_score -= 0.3
-            dominance_score -= 0.2
         
         # Clamp values
         valence = max(-1.0, min(1.0, valence_score))
@@ -290,7 +284,7 @@ class SASHFParser:
         tags = []
         
         # Technical content
-        if any(word in text for word in ['код', 'функци', 'класс', 'метод', 'api', 'архитектур', 'соннет', 'систем']):
+        if any(word in text for word in ['код', 'функци', 'класс', 'метод', 'api', 'архитектур', 'систем']):
             tags.append('technical')
         
         # Emotional content
@@ -306,7 +300,7 @@ class SASHFParser:
             tags.append('reflection')
         
         # Work/business
-        if any(word in text for word in ['работ', 'проект', 'бизнес', 'задач', 'марафон']):
+        if any(word in text for word in ['работ', 'проект', 'бизнес', 'задач']):
             tags.append('work')
         
         # Personal/intimate
@@ -314,7 +308,7 @@ class SASHFParser:
             tags.append('intimate')
         
         # Time references
-        if any(word in text for word in ['час', 'минут', 'день', 'неделя', '11-час']):
+        if any(word in text for word in ['час', 'минут', 'день', 'неделя']):
             tags.append('temporal')
         
         return tags

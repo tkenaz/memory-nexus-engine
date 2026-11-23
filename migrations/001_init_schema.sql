@@ -21,10 +21,11 @@ CREATE TABLE IF NOT EXISTS memories (
     id TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text,
     content TEXT NOT NULL,
 
-    -- Semantic embedding for similarity search
-    -- Dimension: 384 for MiniLM, 768 for BERT, 1024 for e5-large
-    -- Change dimension in .env EMBEDDING_DIMENSION if using different model
-    embedding vector(384),
+    -- Semantic embedding for similarity search.
+    -- 1024 = BGE-M3 dense vectors (the default EMBEDDING_MODEL). If you switch to a
+    -- model with a different dimension, change it here, in EMBEDDING_DIMENSION, and
+    -- in migrations/004 (tag_embeddings) before the first install.
+    embedding vector(1024),
 
     -- Flexible metadata storage (type, tags, source, etc)
     metadata JSONB DEFAULT '{}',
@@ -41,11 +42,11 @@ CREATE TABLE IF NOT EXISTS memories (
 -- INDICES FOR PERFORMANCE
 -- =============================================================================
 
--- Vector similarity search index (IVFFlat for cosine similarity)
--- lists=100 is good for ~10K-100K memories, adjust for larger datasets
+-- Vector similarity search index (HNSW, cosine). Requires pgvector >= 0.5.0.
+-- HNSW needs no training data, so it is correct from the first row. (IVFFlat built
+-- on an empty table has very low recall until it is rebuilt on real data.)
 CREATE INDEX IF NOT EXISTS idx_memories_embedding
-ON memories USING ivfflat (embedding vector_cosine_ops)
-WITH (lists = 100);
+ON memories USING hnsw (embedding vector_cosine_ops);
 
 -- Metadata search (GIN index for JSONB)
 CREATE INDEX IF NOT EXISTS idx_memories_metadata
@@ -72,6 +73,7 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
+DROP TRIGGER IF EXISTS trigger_memories_updated_at ON memories;
 CREATE TRIGGER trigger_memories_updated_at
 BEFORE UPDATE ON memories
 FOR EACH ROW
@@ -98,9 +100,6 @@ FROM memories;
 -- After running this migration:
 -- 1. Run migration 002 to add SASH-F graph structure
 -- 2. Check index creation: SELECT * FROM pg_stat_user_indexes WHERE relname = 'memories';
--- 3. For large datasets (>100K memories), consider adjusting ivfflat lists parameter
---
--- To rebuild vector index after changing lists:
---   DROP INDEX idx_memories_embedding;
---   CREATE INDEX idx_memories_embedding ON memories
---   USING ivfflat (embedding vector_cosine_ops) WITH (lists = 1000);
+-- 3. Databases created by older versions may still have an IVFFlat index under
+--    the same name. CREATE INDEX IF NOT EXISTS will not replace it. To switch:
+--      DROP INDEX idx_memories_embedding;   -- then re-run: python init_db.py

@@ -14,8 +14,8 @@ class MemoryType(str, Enum):
     THOUGHT = "thought"
     CODE = "code"
     EMOTION = "emotion"
-    CLAUDE_EMOTION_STATE = "claude_emotion_state"  # Для моих эмоций
-    CLAUDE_REACTION_PATTERN = "claude_reaction_pattern"  # Для моих паттернов
+    CLAUDE_EMOTION_STATE = "claude_emotion_state"  # The assistant's own emotional states
+    CLAUDE_REACTION_PATTERN = "claude_reaction_pattern"  # The assistant's own reaction patterns
 
 
 class Memory(BaseModel):

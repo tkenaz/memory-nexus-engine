@@ -14,20 +14,21 @@ from mcp.server.stdio import stdio_server
 
 from ..storage.postgres_enhanced import EnhancedPostgresStorage
 from ..models.memory_simple import SearchQuery, Memory
-from ..assembler.context_assembler import ContextAssembler
-from ..utils.temporal_parser import TemporalParser
 from config.settings import settings
 
 # Disable structlog stdout output for MCP
 logging.basicConfig(level=logging.ERROR, handlers=[])
+
+# How much of a record get_recent_memories shows inline. Anything longer is cut,
+# and the cut is announced in-band — see the marker in the handler. Roughly 9% of
+# records exceed this (365 of 3936 as of 2026-09-02), so it is not a rare edge case.
+PREVIEW_LIMIT = 2000
 
 
 async def run_server():
     """Run MCP server with SASH-F enhanced storage"""
     # Initialize enhanced storage with SASH-F
     storage = EnhancedPostgresStorage()
-    assembler = ContextAssembler(budget=50000)
-    temporal_parser = TemporalParser()
     
     await storage.initialize()
     
@@ -43,13 +44,20 @@ async def run_server():
         return [
             types.Tool(
                 name="search_memories_enhanced",
-                description="Enhanced hybrid search with semantic + keyword fallback + SASH-F structure",
+                description="Hybrid search: RRF fusion of semantic + keyword + tag-catalog engines, with SASH-F structure",
                 inputSchema={
                     "type": "object",
                     "properties": {
                         "query": {
                             "type": "string",
-                            "description": "Search query"
+                            "description": (
+                                "Search query. Best results: either a precise anchor "
+                                "(name/place/project: 'Lisbon', 'pgvector') or a fleshed-out "
+                                "phrase describing the memory you expect to find "
+                                "('we flew to the city together, walked a lot, stayed in a hotel'). "
+                                "Avoid bare 1-2-word category labels ('travel') — "
+                                "dense search is weakest there; expand them or add an anchor."
+                            )
                         },
                         "limit": {
                             "type": "integer",
@@ -104,6 +112,24 @@ async def run_server():
                             "default": 3
                         }
                     }
+                }
+            ),
+            types.Tool(
+                name="get_memory",
+                description=(
+                    "Get ONE memory by id, always in full — never truncated. "
+                    "This is the tool the [TRUNCATED] marker in get_recent_memories points to: "
+                    "call it before quoting or reasoning about a truncated record."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "id": {
+                            "type": "string",
+                            "description": "Memory id, e.g. mem_1788301919942_19515372"
+                        }
+                    },
+                    "required": ["id"]
                 }
             ),
             types.Tool(
@@ -235,19 +261,41 @@ async def run_server():
                 limit = arguments.get("limit", 10)
 
                 async with storage.pool.acquire() as conn:
+                    # The parent row holds the whole record. Child rows are overlapping
+                    # slices of that same text, kept for vector search — verified against
+                    # the corpus 2026-09-02: the first chunk is a substring of the parent
+                    # in 494 of 527 chunked records. So never sum them into a length, and
+                    # never concatenate them back: that double-counts the text.
                     rows = await conn.fetch("""
-                        SELECT id, content, metadata, sashf, created_at
-                        FROM memories
-                        WHERE parent_id IS NULL
-                        ORDER BY created_at DESC
+                        SELECT m.id, m.content, m.metadata, m.sashf, m.created_at
+                        FROM memories m
+                        WHERE m.parent_id IS NULL
+                        ORDER BY m.created_at DESC
                         LIMIT $1
                     """, limit)
 
                 memories = []
                 for row in rows:
+                    content = row["content"]
+                    full_length = len(content)
+                    shown = min(full_length, PREVIEW_LIMIT)
+                    truncated = shown < full_length
+                    if truncated:
+                        # A silent "..." is indistinguishable from a complete record, so the
+                        # reader fills the missing tail in from imagination and then states it
+                        # as fact. Say it loudly, in-band, and name the tool that returns the rest.
+                        content = (
+                            content[:PREVIEW_LIMIT]
+                            + f"\n\n⚠️ [TRUNCATED: showing {shown} of {full_length} characters. "
+                            + "The rest is NOT visible: do not quote it or draw conclusions from this fragment. "
+                            + f'Full text: get_memory(id="{row["id"]}")]'
+                        )
                     memories.append({
                         "id": row["id"],
-                        "content": row["content"][:2000] + "..." if len(row["content"]) > 2000 else row["content"],
+                        "content": content,
+                        "truncated": truncated,
+                        "shown_chars": shown,
+                        "full_length": full_length,
                         "metadata": json.loads(row["metadata"]) if row["metadata"] else {},
                         "sashf": json.loads(row["sashf"]) if row["sashf"] else {},
                         "created_at": row["created_at"].isoformat() if row["created_at"] else None
@@ -258,6 +306,48 @@ async def run_server():
                     text=json.dumps({
                         "total": len(memories),
                         "memories": memories
+                    }, indent=2, ensure_ascii=False)
+                )]
+
+            elif name == "get_memory":
+                memory_id = arguments["id"]
+
+                async with storage.pool.acquire() as conn:
+                    row = await conn.fetchrow("""
+                        SELECT id, content, metadata, sashf, created_at, parent_id
+                        FROM memories
+                        WHERE id = $1
+                    """, memory_id)
+
+                    if row is None:
+                        return [types.TextContent(
+                            type="text",
+                            text=json.dumps({
+                                "error": f"No memory with id {memory_id}",
+                                "hint": "ids come from get_recent_memories / search_memories_enhanced",
+                            }, ensure_ascii=False)
+                        )]
+
+                    # Diagnostics only. Child rows are overlapping slices of this same
+                    # text used for vector search — concatenating them would duplicate
+                    # content, not extend it.
+                    n_chunks = await conn.fetchval("""
+                        SELECT count(*) FROM memories WHERE parent_id = $1
+                    """, memory_id)
+
+                content = row["content"]
+
+                return [types.TextContent(
+                    type="text",
+                    text=json.dumps({
+                        "id": row["id"],
+                        "content": content,
+                        "truncated": False,
+                        "full_length": len(content),
+                        "search_chunks": int(n_chunks),
+                        "metadata": json.loads(row["metadata"]) if row["metadata"] else {},
+                        "sashf": json.loads(row["sashf"]) if row["sashf"] else {},
+                        "created_at": row["created_at"].isoformat() if row["created_at"] else None,
                     }, indent=2, ensure_ascii=False)
                 )]
 

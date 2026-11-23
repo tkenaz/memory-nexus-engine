@@ -23,17 +23,16 @@ class SearchQuery(BaseModel):
     """Search query parameters"""
     query: str
     limit: int = Field(default=10, ge=1, le=100)
-    min_similarity: Optional[float] = Field(default=0.01, ge=0.0, le=1.0)  # Низкий порог!
+    min_similarity: Optional[float] = Field(default=0.01, ge=0.0, le=1.0)  # Low threshold!
     metadata_filters: Optional[Dict[str, Any]] = None
-    use_hybrid: bool = True  # Включить гибридный поиск
-    use_reranking: bool = True  # Включить cross-encoder reranking
+    use_hybrid: bool = True  # Enable hybrid search
     
     
 class SearchResult(BaseModel):
     """Search result with scores"""
     memory: Memory
-    score: float  # similarity для semantic, rank для keyword
-    search_type: str  # "semantic" или "keyword"
+    score: float  # similarity for semantic, rank for keyword
+    search_type: str  # "semantic" or "keyword"
     
     class Config:
         json_encoders = Memory.Config.json_encoders

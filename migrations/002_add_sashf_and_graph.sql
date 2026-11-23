@@ -82,31 +82,35 @@ CREATE INDEX IF NOT EXISTS idx_patterns_actors ON memory_patterns USING GIN(acto
 -- 7. Create function for automatic link creation
 CREATE OR REPLACE FUNCTION create_temporal_links()
 RETURNS TRIGGER AS $$
-DECLARE
-    recent_memory RECORD;
 BEGIN
-    -- Find memories from the last 24 hours to link
-    FOR recent_memory IN 
-        SELECT id, sashf, created_at
-        FROM memories
-        WHERE id != NEW.id
-        AND created_at > NEW.created_at - INTERVAL '24 hours'
-        AND created_at < NEW.created_at
-        ORDER BY created_at DESC
-        LIMIT 5
-    LOOP
-        -- Create AFTER link
-        INSERT INTO memory_links (from_id, to_id, link_type, weight, confidence)
-        VALUES (recent_memory.id, NEW.id, 'after', 
-                CASE 
-                    WHEN NEW.created_at - recent_memory.created_at < INTERVAL '1 hour' THEN 0.9
-                    WHEN NEW.created_at - recent_memory.created_at < INTERVAL '6 hours' THEN 0.7
-                    ELSE 0.5
-                END,
-                0.7)
-        ON CONFLICT DO NOTHING;
-    END LOOP;
-    
+    -- Link a new memory to up to five memories from the 24 hours before it:
+    -- (from_id = new, to_id = earlier, 'after') reads "new is after earlier".
+    -- Graph expansion walks from_id -> to_id, i.e. from a hit to what preceded it.
+    -- The window is relative to NEW.created_at, so imported historical memories
+    -- are linked as well. Chunks are skipped: they belong to their parent, and
+    -- graph expansion only walks parents. (parent_id comes from migration 003;
+    -- plpgsql resolves columns at run time, after all migrations have run.)
+    IF NEW.parent_id IS NOT NULL THEN
+        RETURN NEW;
+    END IF;
+
+    INSERT INTO memory_links (from_id, to_id, link_type, weight, confidence)
+    SELECT NEW.id, m.id, 'after',
+           CASE
+               WHEN NEW.created_at - m.created_at < INTERVAL '1 hour' THEN 0.9
+               WHEN NEW.created_at - m.created_at < INTERVAL '6 hours' THEN 0.7
+               ELSE 0.5
+           END,
+           0.7
+    FROM memories m
+    WHERE m.id != NEW.id
+      AND m.parent_id IS NULL
+      AND m.created_at > NEW.created_at - INTERVAL '24 hours'
+      AND m.created_at < NEW.created_at
+    ORDER BY m.created_at DESC
+    LIMIT 5
+    ON CONFLICT DO NOTHING;
+
     RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;
@@ -231,11 +235,13 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
+DROP TRIGGER IF EXISTS update_memory_links_updated_at ON memory_links;
 CREATE TRIGGER update_memory_links_updated_at
 BEFORE UPDATE ON memory_links
 FOR EACH ROW
 EXECUTE FUNCTION update_updated_at();
 
+DROP TRIGGER IF EXISTS update_memory_patterns_updated_at ON memory_patterns;
 CREATE TRIGGER update_memory_patterns_updated_at
 BEFORE UPDATE ON memory_patterns
 FOR EACH ROW

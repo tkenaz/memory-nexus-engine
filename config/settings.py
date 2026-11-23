@@ -1,70 +1,61 @@
-"""Configuration management for Memory Nexus"""
-import os
-from pathlib import Path
-from typing import Optional
-from dotenv import load_dotenv
-from pydantic_settings import BaseSettings
-from pydantic import validator, computed_field
+"""Configuration for Memory Nexus.
 
-# Load environment variables
-# Resolve .env relative to the repo root, not the cwd (Claude Desktop/Code
-# spawn MCP servers from an arbitrary working directory).
+Values come from environment variables or from a .env file in the repository
+root (see .env.example). Every setting below is read by the code; there are no
+placeholders for features that do not exist.
+"""
+from pathlib import Path
+
+from dotenv import load_dotenv
+from pydantic import computed_field
+from pydantic_settings import BaseSettings
+
+# Resolve .env relative to the repo root, not the cwd: MCP hosts (Claude Desktop,
+# Claude Code) spawn servers from an arbitrary working directory.
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 
 class Settings(BaseSettings):
-    """Application settings with validation"""
-    
-    # Paths
-    BASE_DIR: Path = Path(__file__).parent.parent
-    EMBEDDING_CACHE_DIR: Path = BASE_DIR / "embeddings_cache"
-    
+    """Application settings."""
+
     # PostgreSQL
     PG_HOST: str = "localhost"
     PG_PORT: int = 5432
-    PG_DB: str = "claude"
+    PG_DB: str = "memory_nexus"
     PG_USER: str = "postgres"
-    PG_PASSWORD: str = ""  # set in .env — never hardcode a secret in source
-    
+    PG_PASSWORD: str = ""  # set in .env; never hardcode a secret in source
+
+    # Connection pool per server process. An MCP stdio server serves one client,
+    # so a few connections are enough; several clients means several processes.
+    PG_POOL_MIN: int = 1
+    PG_POOL_MAX: int = 5
+
+    # When false, the server connects as a least-privilege runtime role and skips
+    # startup DDL; an owner role applies migrations separately (python init_db.py).
+    AUTO_MIGRATE: bool = True
+
     @computed_field
     @property
     def PG_DSN(self) -> str:
         return f"postgresql://{self.PG_USER}:{self.PG_PASSWORD}@{self.PG_HOST}:{self.PG_PORT}/{self.PG_DB}"
-    
-    # Neo4j
-    NEO4J_URI: str = "bolt://localhost:7687"
-    NEO4J_USER: str = "neo4j"
-    NEO4J_PASSWORD: str = ""
-    
-    # Redis
-    REDIS_URL: str = "redis://localhost:6379/0"
-    
-    # ML Models
-    EMBEDDING_MODEL: str = "intfloat/multilingual-e5-large"  # Наша проверенная модель — БД закодирована ею!
-    RERANK_MODEL: str = "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1"  # Multilingual reranker
-    EMBEDDING_DIMENSION: int = 1024  # BGE-M3 dense embeddings
 
-    # Search parameters
-    MIN_SIMILARITY: float = 0.15  # После re-embed BGE-M3 дает нормальные scores (0.2-0.9)
-    SEARCH_LIMIT: int = 50
-    USE_RERANKING: bool = True  # Включить cross-encoder reranking
-    RERANK_TOP_K: int = 10  # Сколько результатов вернуть после reranking
-    KEYWORD_WEIGHT: float = 0.3
-    SEMANTIC_WEIGHT: float = 0.7
-    KEYWORD_FALLBACK_THRESHOLD: float = 0.4  # Порог для fallback на keyword search
-    
-    @validator("KEYWORD_WEIGHT")
-    def validate_weights(cls, v, values):
-        """Ensure weights sum to 1.0"""
-        # Проверяем только если SEMANTIC_WEIGHT уже загружен
-        return v
-    
-    # Memory parameters
-    IMPORTANCE_DECAY_RATE: float = 0.97
-    MIN_IMPORTANCE: float = 0.05
-    IMPORTANCE_NOVELTY_WEIGHT: float = 0.4
-    IMPORTANCE_EMOTION_WEIGHT: float = 0.6
-    
+    # Embeddings
+    # BGE-M3, loaded through FlagEmbedding (BGEM3FlagModel). Earlier snapshots set
+    # e5-large here while the code loaded it through the BGE-M3 wrapper (no e5
+    # query:/passage: prefixes, wrong pooling), so vectors were silently degraded.
+    # Changing the model means re-embedding: reembed_all.py, then
+    # build_tag_index.py --rebuild.
+    EMBEDDING_MODEL: str = "BAAI/bge-m3"
+    EMBEDDING_DIMENSION: int = 1024  # must match the vector(N) columns in migrations/
+
+    # Search
+    MIN_SIMILARITY: float = 0.15  # BGE-M3 cosine scores typically fall in 0.2-0.9
+    RRF_K: int = 60  # Reciprocal Rank Fusion: score = sum(1 / (RRF_K + rank))
+
+    # Tag catalog: third retrieval engine fused by RRF (see migrations/004)
+    TAG_TOP_K: int = 8               # candidate tags taken from the catalog
+    TAG_MIN_SIMILARITY: float = 0.5  # query-to-tag cosine threshold (BGE-M3)
+
     # Graph expansion
     # High-frequency entities to exclude from graph hub-expansion: they over-link
     # and act as false super-hubs. Customize for your own world (people, projects,
@@ -72,36 +63,14 @@ class Settings(BaseSettings):
     GRAPH_STOP_ACTORS: list = []
 
     # Chunking
-    CHUNK_MAX_SIZE: int = 1500    # ~400 токенов mixed ru/en
-    CHUNK_OVERLAP: int = 200      # перекрытие между чанками
-    CHUNK_MIN_SIZE: int = 100     # не создавать крошечные фрагменты
+    CHUNK_MAX_SIZE: int = 1500    # characters, ~400 tokens of mixed-language text
+    CHUNK_OVERLAP: int = 200      # overlap between neighbouring chunks
+    CHUNK_MIN_SIZE: int = 100     # do not create tiny fragments
 
-    # Cache
-    CACHE_TTL: int = 3600  # seconds
-    
-    # Logging
-    LOG_LEVEL: str = "INFO"
-    LOG_FORMAT: str = "json"  # json or human
-    
-    # MCP
-    MCP_SERVER_NAME: str = "memory-nexus"
-    MCP_SERVER_VERSION: str = "2.0.0"
-    
     class Config:
         env_file = ".env"
         case_sensitive = True
         extra = "ignore"
 
 
-# Global settings instance
 settings = Settings()
-
-# Create cache directory if not exists and we have write access
-try:
-    settings.EMBEDDING_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-except OSError:
-    # Running in read-only environment (e.g. Claude Desktop)
-    # Use temp directory instead
-    import tempfile
-    settings.EMBEDDING_CACHE_DIR = Path(tempfile.gettempdir()) / "memory_nexus_cache"
-    settings.EMBEDDING_CACHE_DIR.mkdir(parents=True, exist_ok=True)

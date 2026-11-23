@@ -42,8 +42,8 @@ async def main():
         nonlocal encoder
         if encoder is None:
             print("Loading BGE-M3 model...", file=sys.stderr)
-            from FlagEmbedding import BGEM3FlagModel
-            encoder = BGEM3FlagModel(settings.EMBEDDING_MODEL, use_fp16=True)
+            from src.core.encoder import load_bge_m3
+            encoder = load_bge_m3(settings.EMBEDDING_MODEL, use_fp16=True)
             print("Model loaded.", file=sys.stderr)
 
         result = encoder.encode(
